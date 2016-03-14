@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -17,25 +18,22 @@ import (
 const l = "06/25-00:07:15.545982  [**] [1:524:8] BAD-TRAFFIC tcp port 0 traffic [**] [Classification: Misc activity] [Priority: 3] {TCP} 173.180.6.172:44779 -> 24.86.161.95:0"
 const timeParse = `01/02-15:04:05.000000`
 
-var regexpStr = map[string]string{
-	"timeRegex":                 `\d{1,2}\/\d{1,2}-\d{1,2}:\d{1,2}:\d{1,2}\.\d+`,
-	"hostRegex":                 `\d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}:{0,1}\d*`,
-	"ipFromHostRegex":           `\d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}`,
-	"portFromHostRegex":         `\d+$`,
-	"protoRegex":                `\{\w+\}`,
-	"protoSecondRegex":          `\w+`,
-	"typeRegex":                 `\[\*\*\].+\[\*\*\]`,
-	"typeCodeRegex":             `\d+:\d+:\d+`,
-	"typeDescRegex":             `[A-Za-z][\ a-zA-Z\-0-9]+`,
-	"classificationRegex":       `\[Classification:\D+\]`,
-	"classificationSecondRegex": `\D+`,
-	"priorityRegex":             `\[Priority: \d+\]`,
-	"prioritySecondRegex":       `\d+`,
-	"hostToHostRegex":           `\d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}:{0,1}\d* -> \d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}:{0,1}\d*`,
+var regexpStr = map[string][]string{
+	"timeRegex":           {`\d{1,2}\/\d{1,2}-\d{1,2}:\d{1,2}:\d{1,2}\.\d+`},
+	"hostRegex":           {`\d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}:{0,1}\d*`},
+	"ipFromHostRegex":     {`\d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}`},
+	"portFromHostRegex":   {`\d+$`},
+	"protoRegex":          {`\{\w+\}`, `\w+`},
+	"typeRegex":           {`\[\*\*\].+\[\*\*\]`},
+	"typeCodeRegex":       {`\d+:\d+:\d+`},
+	"typeDescRegex":       {`[A-Za-z][\ a-zA-Z\-0-9]+`},
+	"classificationRegex": {`Classification:[\s\w]+`, `:[\w\s]+`, `[\w\s]+`},
+	"priorityRegex":       {`\[Priority: \d+\]`, `\d+`},
+	"hostToHostRegex":     {`\d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}:{0,1}\d* -> \d{1,3}\.\d{1,3}\.\d{1,3}.\d{1,3}:{0,1}\d*`},
 }
 
+var regexs map[string][]*regexp.Regexp
 var database *gorp.DbMap
-var regexs map[string]*regexp.Regexp
 
 // Entry is a structure that represents a snort log
 type Entry struct {
@@ -52,20 +50,62 @@ type Entry struct {
 }
 
 func init() {
-	regexs = make(map[string]*regexp.Regexp)
-	for idx, r := range regexpStr {
-		regexs[idx] = regexp.MustCompile(r)
+	regexs = make(map[string][]*regexp.Regexp)
+	for idx, a := range regexpStr {
+		regexs[idx] = make([]*regexp.Regexp, 0, 3)
+		for i, r := range a {
+
+			regexs[idx] = append(regexs[idx], regexp.MustCompile(r))
+			fmt.Println(idx, i, regexs[idx])
+		}
 	}
-	database = initDb(os.Args[1])
 }
 
 func main() {
+	infoChan := make(chan Entry, 200)
+	countChan := make(chan int, 200)
+	count := 0
+	done := 0
+	buffer := make([]interface{}, 0, 1000)
+	database = initDb(os.Args[1])
+	defer database.Db.Close()
 	for _, alertFile := range os.Args[2:] {
-		parseAlert(alertFile)
+		go parseAlert(alertFile, infoChan, countChan)
+	}
+	for {
+
+		select {
+		case _ = <-countChan:
+			count++
+			fmt.Println("Inserted ", done, "/", count)
+		case temp := <-infoChan:
+			done++
+			insertEntries(buffer, temp)
+			fmt.Println("Inserted ", done, "/", count)
+			if done >= count {
+				select { // race condition work around
+				case <-time.After(time.Second):
+					err := database.Insert(buffer...)
+					perror("Error on insert", err)
+					return
+				case _ = <-countChan:
+					count++
+				}
+			}
+		}
 	}
 }
 
-func parseAlert(alertFile string) {
+// bulk insert
+func insertEntries(buffer []interface{}, temp Entry) {
+	buffer = append(buffer, &temp)
+	if len(buffer) > 999 {
+		err := database.Insert(buffer...)
+		perror("Error on insert", err)
+	}
+}
+
+func parseAlert(alertFile string, info chan Entry, count chan int) {
 	file, err := os.Open(alertFile)
 	if err != nil {
 		log.Println("File: ", alertFile, " could not be opened: ", err)
@@ -77,32 +117,33 @@ func parseAlert(alertFile string) {
 		return
 	}
 	for line, err := buf.ReadString('\n'); err == nil; line, err = buf.ReadString('\n') {
-		go handleLine(line)
+		count <- 1
+		go handleLine(line, info)
 	}
 }
 
-func handleLine(line string) {
+func handleLine(line string, info chan Entry) {
 	newEntry := Entry{}
 	newEntry.readTime(line)
 	newEntry.readType(line)
 	newEntry.getHosts(line)
 	newEntry.getProtocol(line)
-	fmt.Println(newEntry)
-	database.Insert(newEntry)
-
+	newEntry.getClassification(line)
+	newEntry.getPriority(line)
+	info <- newEntry
 }
 
 func (e *Entry) readTime(line string) {
 	var err error
-	timeString := regexs["timeRegex"].FindString(line)
+	timeString := regexs["timeRegex"][0].FindString(line)
 	e.Time, err = time.Parse(timeParse, timeString)
 	perror("could not parse string "+timeString, err)
 }
 
 func (e *Entry) readType(line string) {
-	typeString := regexs["typeRegex"].FindString(line)
-	e.TypeCode = regexs["typeCodeRegex"].FindString(typeString)
-	e.Type = regexs["typeDescRegex"].FindString(typeString)
+	typeString := regexs["typeRegex"][0].FindString(line)
+	e.TypeCode = regexs["typeCodeRegex"][0].FindString(typeString)
+	e.Type = regexs["typeDescRegex"][0].FindString(typeString)
 }
 
 func (e *Entry) getHosts(line string) {
@@ -111,30 +152,32 @@ func (e *Entry) getHosts(line string) {
 			log.Println(line)
 		}
 	}()
-	hostToHost := regexs["hostToHostRegex"].FindString(line)
-	hosts := regexs["hostRegex"].FindAllString(hostToHost, 2)
-	e.SrcIP = regexs["ipFromHostRegex"].FindString(hosts[0])
-	e.SrcPort = regexs["portFromHostRegex"].FindString(hosts[0])
+	hosts := regexs["hostRegex"][0].FindAllString(line, 2)
+	e.SrcIP = regexs["ipFromHostRegex"][0].FindString(hosts[0])
+	e.SrcPort = regexs["portFromHostRegex"][0].FindString(hosts[0])
 
-	e.DstIP = regexs["ipFromHostRegex"].FindString(hosts[1])
-	e.DstPort = regexs["portFromHostRegex"].FindString(hosts[1])
+	e.DstIP = regexs["ipFromHostRegex"][0].FindString(hosts[1])
+	e.DstPort = regexs["portFromHostRegex"][0].FindString(hosts[1])
 
 }
 
 func (e *Entry) getProtocol(line string) {
-	s := regexs["protoRegex"].FindString(line)
-	e.Protocol = regexs["protoSecondRegex"].FindString(s)
+	e.Protocol = regexs["protoRegex"][0].FindString(line)
+	e.Protocol = regexs["protoRegex"][1].FindString(e.Protocol)
 }
 
 func (e *Entry) getClassification(line string) {
-	e.Classification = regexs["classificationRegex"].FindString(line)
-	e.Classification = regexs["classificationSecondRegex"].FindString(line)
+	e.Classification = line
+	for _, reg := range regexs["classificationRegex"] {
+		e.Classification = reg.FindString(e.Classification)
+	}
+	e.Classification = strings.Trim(e.Classification, " ")
 }
 
 func (e *Entry) getPriority(line string) {
 	var err error
-	str := regexs["priorityRegex"].FindString(line)
-	str = regexs["prioritySecondRegex"].FindString(str)
+	str := regexs["priorityRegex"][0].FindString(line)
+	str = regexs["priorityRegex"][1].FindString(str)
 	e.Priority, err = strconv.Atoi(str)
 	perror("Can't read priority", err)
 }
