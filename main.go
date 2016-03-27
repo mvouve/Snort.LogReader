@@ -66,7 +66,7 @@ func main() {
 	countChan := make(chan int, 200)
 	count := 0
 	done := 0
-	buffer := make([]interface{}, 0, 1000)
+	buffer := make([]interface{}, 0, 513)
 	database = initDb(os.Args[1])
 	defer database.Db.Close()
 	for _, alertFile := range os.Args[2:] {
@@ -80,9 +80,10 @@ func main() {
 			fmt.Println("Inserted ", done, "/", count)
 		case temp := <-infoChan:
 			done++
-			insertEntries(buffer, temp)
+			insertEntries(&buffer, temp)
 			fmt.Println("Inserted ", done, "/", count)
 			if done >= count {
+				/*TODO: Fix race condition*/
 				select { // race condition work around
 				case <-time.After(time.Second):
 					err := database.Insert(buffer...)
@@ -97,11 +98,12 @@ func main() {
 }
 
 // bulk insert
-func insertEntries(buffer []interface{}, temp Entry) {
-	buffer = append(buffer, &temp)
-	if len(buffer) > 999 {
-		err := database.Insert(buffer...)
+func insertEntries(buffer *[]interface{}, temp Entry) {
+	*buffer = append(*buffer, &temp)
+	if len(*buffer) > 512 {
+		err := database.Insert(*buffer...)
 		perror("Error on insert", err)
+		*buffer = (*buffer)[0:0]
 	}
 }
 
